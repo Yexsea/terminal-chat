@@ -1,68 +1,91 @@
-import socket
-import threading
+"""Yakishi Terminal Chat — relay server.
+
+The relay only forwards encrypted packets between the members of one room.
+It never sees passwords, keys, names or message text.
+"""
+import asyncio
+import json
 import os
+import re
+import time
+from http import HTTPStatus
+
+from websockets.asyncio.server import broadcast, serve
+from websockets.exceptions import ConnectionClosed
 
 # Render port atarsa onu kullan, yoksa 10000
 PORT = int(os.environ.get("PORT", 10000))
-clients = []
+MAX_PACKET = 64 * 1024                    # bir paket en fazla 64 KB
+MAX_PER_SECOND = 10                       # bağlantı başına saniyede en fazla 10 paket
+ROOM_ID = re.compile(r"^[0-9a-f]{64}$")  # oda kimliği: istemcinin türettiği 32 baytlık hex
 
-def handle_client(conn, addr):
-    print(f"[+] Yeni bağlantı: {addr}")
+rooms = {}                                # oda kimliği -> bağlantılar
+
+
+def health_check(connection, request):
+    # Barındırma platformları (Render) servisi düz bir HTTP isteğiyle yoklar.
+    # WebSocket olmayan isteklere "ayaktayım" cevabı verilir.
+    if request.headers.get("Upgrade", "").lower() != "websocket":
+        return connection.respond(HTTPStatus.OK, "Yakishi Relay Alive\n")
+    return None
+
+
+def leave(ws, room):
+    members = rooms.get(room)
+    if members:
+        members.discard(ws)
+        if not members:
+            del rooms[room]
+
+
+async def handler(ws):
+    room = None
+    window, count = time.monotonic(), 0
     try:
-        # İlk mesajı al
-        data = conn.recv(4096)
-        if not data:
-            conn.close()
-            return
-            
-        # MÜHENDİSLİK HİLESİ: Render'ın "Health Check" botu HTTP GET isteği atar.
-        # Eğer bu bir HTTP isteğiyse, onu kandırıp "200 OK" dönüyoruz ki sunucuyu kapatmasın.
-        if data.startswith(b"GET") or data.startswith(b"POST"):
-            conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nYakishi Server Alive")
-            conn.close()
-            return
-            
-        # Eğer HTTP değilse (Yani bizim Python programımız bağlandıysa), listeye ekle
-        clients.append(conn)
-        
-        # İlk gelen veriyi de hemen diğerlerine ilet
-        broadcast(data, conn)
+        async for raw in ws:
+            # Hız sınırı
+            now = time.monotonic()
+            if now - window >= 1:
+                window, count = now, 0
+            count += 1
+            if count > MAX_PER_SECOND or not isinstance(raw, str):
+                continue
 
-        # Dinlemeye devam et
-        while True:
-            data = conn.recv(4096)
-            if not data:
-                break
-            broadcast(data, conn)
-            
-    except Exception as e:
-        print(f"[-] Hata ({addr}): {e}")
-        
-    finally:
-        if conn in clients:
-            clients.remove(conn)
-        conn.close()
-        print(f"[-] Bağlantı koptu: {addr}")
-
-def broadcast(data, sender_conn):
-    # Gelen veriyi (şifreli paketi) gönderen hariç herkese fırlat
-    for c in clients:
-        if c != sender_conn:
             try:
-                c.send(data)
-            except:
-                if c in clients:
-                    clients.remove(c)
+                packet = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(packet, dict):
+                continue
 
-def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("0.0.0.0", PORT))
-    server.listen()
-    print(f"[*] Yakishi Relay Server {PORT} portunda dinliyor...")
+            kind = packet.get("type")
+            if kind == "join":
+                new_room = packet.get("room")
+                if isinstance(new_room, str) and ROOM_ID.match(new_room):
+                    if room:
+                        leave(ws, room)
+                    room = new_room
+                    rooms.setdefault(room, set()).add(ws)
 
-    while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            elif kind == "msg" and room:
+                payload = packet.get("payload")
+                if isinstance(payload, str) and 0 < len(payload) <= MAX_PACKET - 1024:
+                    peers = [peer for peer in rooms.get(room, ()) if peer is not ws]
+                    broadcast(peers, json.dumps({"type": "msg", "payload": payload}))
+            # Diğer her şey (bozuk paketler dahil) yok sayılır, kimseye iletilmez.
+    except ConnectionClosed:
+        pass
+    finally:
+        if room:
+            leave(ws, room)
+
+
+async def main():
+    async with serve(handler, "0.0.0.0", PORT, process_request=health_check,
+                     max_size=MAX_PACKET, ping_interval=25, ping_timeout=20) as server:
+        print(f"[*] Yakishi Relay Server {PORT} portunda dinliyor...")
+        await server.serve_forever()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
